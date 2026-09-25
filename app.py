@@ -108,4 +108,7 @@ with gr.Blocks(css=CSS,title="HopIN") as demo:
 Drivers post trips they are already taking → riders search and reserve → seats automatically decrease → rider cancellations restore seats → driver cancellations close the trip and look for another matching ride.
 
 **Prototype only:** no real payments, TCU authentication, GPS, driver verification, or real notifications. Use demo data only.""")
-if __name__=="__main__": demo.launch()
+if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", 7860))
+    demo.launch(server_name="0.0.0.0", server_port=port)
