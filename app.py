@@ -1,533 +1,812 @@
 
-# HopIN — TCU-themed student carpool prototype
-# Render-ready classroom demonstration.
-# Use fictional information only.
+"""HopIN — responsive TCU-themed classroom ride-sharing demo.
+No identity verification, payments, notifications, or driver authorization.
+"""
 
 import os
 import re
+import html
 import uuid
 import sqlite3
-from datetime import datetime, date
+from datetime import date, datetime
 from threading import RLock
 
 import gradio as gr
-import pandas as pd
 
-DB_PATH = os.environ.get("HOPIN_DB_PATH", "hopin_demo.sqlite3")
-lock = RLock()
+DB = os.environ.get("HOPIN_DB_PATH", "hopin_v2_demo.sqlite3")
+LOCK = RLock()
+TIMES = [
+    f"{h:02d}:{m:02d}"
+    for h in range(6, 24)
+    for m in (0, 15, 30, 45)
+]
 
 
-def db():
-    con = sqlite3.connect(DB_PATH, timeout=15)
+# ----------------------------------------
+# DATABASE
+# ----------------------------------------
+
+def connect():
+    con = sqlite3.connect(DB, timeout=20)
     con.row_factory = sqlite3.Row
     return con
 
 
-with db() as con:
+with connect() as con:
     con.executescript("""
     CREATE TABLE IF NOT EXISTS rides (
-        ride_id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY,
         driver TEXT NOT NULL,
-        driver_email TEXT NOT NULL,
+        email TEXT NOT NULL,
         destination TEXT NOT NULL,
-        trip_date TEXT NOT NULL,
-        depart_time TEXT NOT NULL,
         pickup TEXT NOT NULL,
-        seats_total INTEGER NOT NULL,
-        seats_left INTEGER NOT NULL,
-        gas_share REAL NOT NULL,
-        trip_type TEXT NOT NULL,
+        ride_date TEXT NOT NULL,
+        depart TEXT NOT NULL,
         return_time TEXT,
-        stay_minutes INTEGER NOT NULL,
-        wait_minutes INTEGER NOT NULL,
-        notes TEXT,
-        status TEXT NOT NULL DEFAULT 'OPEN'
+        seats INTEGER NOT NULL,
+        available INTEGER NOT NULL,
+        gas REAL NOT NULL,
+        wait INTEGER NOT NULL,
+        notes TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'open'
     );
 
     CREATE TABLE IF NOT EXISTS bookings (
-        booking_id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY,
         ride_id TEXT NOT NULL,
         rider TEXT NOT NULL,
-        rider_email TEXT NOT NULL,
+        email TEXT NOT NULL,
         seats INTEGER NOT NULL,
-        leg TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'BOOKED'
-    );
-
-    CREATE TABLE IF NOT EXISTS events (
-        created_at TEXT,
-        event TEXT,
-        details TEXT
+        trip TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'booked',
+        created TEXT NOT NULL
     );
     """)
 
 
-def event(con, name, details):
-    con.execute(
-        "INSERT INTO events VALUES (?,?,?)",
-        (
-            datetime.now().strftime("%Y-%m-%d %H:%M"),
-            name,
-            details
-        )
-    )
+# ----------------------------------------
+# HELPERS
+# ----------------------------------------
+
+def clean(value):
+    return str(value or "").strip()
 
 
-def demo_email(value):
-    # Email formatting only. NOT actual TCU authentication.
+def valid_email(value):
     return bool(
         re.fullmatch(
             r"[^\s@]+@tcu\.edu",
-            str(value).strip(),
+            clean(value),
             flags=re.I
         )
     )
 
 
-def uid(n=7):
-    return uuid.uuid4().hex[:n].upper()
+def day_string(value):
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    value = clean(value)
+
+    if not value:
+        return ""
+
+    return date.fromisoformat(value[:10]).isoformat()
 
 
-def ride_rows(destination="", day="", max_gas=None):
-    with db() as con:
+def new_id():
+    return uuid.uuid4().hex[:8].upper()
+
+
+def money(value):
+    return f"${value:,.2f}"
+
+
+# ----------------------------------------
+# FIND RIDES
+# ----------------------------------------
+
+def list_rides(
+    destination="",
+    selected_day="",
+    when="Any time",
+    max_gas=25
+):
+    try:
+        day = day_string(selected_day)
+    except ValueError:
+        day = ""
+
+    with connect() as con:
         rows = con.execute("""
-            SELECT * FROM rides
-            WHERE status='OPEN' AND seats_left>0
-            ORDER BY trip_date, depart_time
+            SELECT *
+            FROM rides
+            WHERE status='open' AND available>0
+            ORDER BY ride_date, depart
         """).fetchall()
 
-    out = []
+    output = []
 
-    for r in rows:
-        if destination and destination.lower() not in r["destination"].lower():
+    for ride in rows:
+        if ride["ride_date"] < date.today().isoformat():
             continue
 
-        if day and day.strip() != r["trip_date"]:
+        if clean(destination).lower() not in ride["destination"].lower():
             continue
 
-        if max_gas is not None and float(r["gas_share"]) > float(max_gas):
+        if day and ride["ride_date"] != day:
             continue
 
-        out.append([
-            r["ride_id"],
-            r["destination"],
-            r["trip_date"],
-            r["depart_time"],
-            r["pickup"],
-            r["driver"],
-            r["seats_left"],
-            f"${r['gas_share']:.2f}",
-            r["trip_type"],
-            r["return_time"] or "—",
-            f"{r['stay_minutes']} min",
-            f"{r['wait_minutes']} min"
-        ])
+        if max_gas is not None and ride["gas"] > float(max_gas):
+            continue
 
-    return pd.DataFrame(
-        out,
-        columns=[
-            "Ride ID",
-            "Destination",
-            "Date",
-            "Leave",
-            "Pickup",
-            "Driver (unverified)",
-            "Seats",
-            "Gas / rider",
-            "Trip type",
-            "Return leaves",
-            "At destination",
-            "Pickup grace"
-        ]
-    )
+        hour = int(ride["depart"][:2])
+
+        if when == "Morning" and hour >= 12:
+            continue
+
+        if when == "Afternoon" and not (12 <= hour < 17):
+            continue
+
+        if when == "Evening" and hour < 17:
+            continue
+
+        output.append(ride)
+
+    return output
 
 
-def search(destination, day, max_gas):
-    if day and day.strip():
-        try:
-            datetime.strptime(day.strip(), "%Y-%m-%d")
-        except ValueError:
-            return ride_rows(), "Use YYYY-MM-DD for the date filter."
+# ----------------------------------------
+# BEAUTIFUL RIDE CARDS
+# ----------------------------------------
+
+def card_html(rows):
+    if not rows:
+        return """
+        <div class="empty">
+            <div class="empty-icon">🚙</div>
+            <h3>No rides found yet</h3>
+            <p>Try another destination or date,
+            or be the first to offer a ride!</p>
+        </div>
+        """
+
+    cards = []
+
+    for ride in rows:
+        destination = html.escape(ride["destination"])
+        driver = html.escape(ride["driver"])
+        pickup = html.escape(ride["pickup"])
+        notes = html.escape(ride["notes"])
+
+        if ride["return_time"]:
+            return_label = (
+                f"↩ Return at {html.escape(ride['return_time'])}"
+            )
+        else:
+            return_label = "→ One-way ride"
+
+        note_html = (
+            f'<p class="ride-note">{notes}</p>'
+            if notes else ""
+        )
+
+        cards.append(f"""
+        <article class="ride-card">
+
+            <div class="ride-top">
+                <span class="pill">
+                    🚗 {ride['available']} seat(s) open
+                </span>
+
+                <span class="ride-price">
+                    {money(ride['gas'])}
+                    <small>suggested / seat</small>
+                </span>
+            </div>
+
+            <h3>{destination}</h3>
+
+            <div class="ride-meta">
+                📅 {ride['ride_date']}
+                &nbsp; · &nbsp;
+                🕒 {ride['depart']}
+            </div>
+
+            <div class="ride-meta">
+                📍 From {pickup}
+            </div>
+
+            <div class="ride-meta">
+                {return_label}
+            </div>
+
+            <div class="ride-meta">
+                ⏳ Waits up to {ride['wait']} minutes
+            </div>
+
+            <div class="ride-bottom">
+                <span>
+                    👤 {driver}
+                    <small>(demo profile)</small>
+                </span>
+
+                <strong>
+                    Ride code: {ride['id']}
+                </strong>
+            </div>
+
+            {note_html}
+
+        </article>
+        """)
 
     return (
-        ride_rows(destination.strip(), day.strip(), max_gas),
-        "Showing matching rides. Profiles are NOT verified."
+        '<div class="ride-grid">'
+        + "".join(cards)
+        + "</div>"
     )
 
 
+def choices(rows):
+    return [
+        (
+            f"{ride['destination']} · "
+            f"{ride['ride_date']} at {ride['depart']} · "
+            f"{ride['id']}",
+            ride["id"]
+        )
+        for ride in rows
+    ]
+
+
+def search(destination, day, period, budget):
+    rows = list_rides(
+        destination,
+        day,
+        period,
+        budget
+    )
+
+    return (
+        card_html(rows),
+        gr.update(
+            choices=choices(rows),
+            value=None
+        ),
+        f"{len(rows)} ride(s) available"
+    )
+
+
+# ----------------------------------------
+# POST A RIDE
+# ----------------------------------------
+
 def post(
-    driver, email, destination, day, depart, pickup,
-    seats, gas, trip_type, return_time, stay, wait, notes
+    driver,
+    email,
+    destination,
+    pickup,
+    day,
+    depart,
+    ret,
+    seats,
+    gas,
+    wait,
+    notes
 ):
-    fields = [driver, email, destination, day, depart, pickup]
+    required = (
+        driver,
+        email,
+        destination,
+        pickup,
+        day,
+        depart
+    )
 
-    if not all(str(x).strip() for x in fields):
-        return "Please complete the required fields.", ride_rows()
-
-    if not demo_email(email):
+    if not all(clean(value) for value in required):
         return (
-            "Use a demo @tcu.edu email format. "
-            "This is NOT real verification.",
-            ride_rows()
+            "Please complete all required fields.",
+            gr.update()
+        )
+
+    if not valid_email(email):
+        return (
+            "Use a demo email ending in @tcu.edu. "
+            "This does not verify student status.",
+            gr.update()
         )
 
     try:
-        trip_day = datetime.strptime(day.strip(), "%Y-%m-%d").date()
-        leave = datetime.strptime(depart.strip(), "%H:%M").time()
+        ride_day = day_string(day)
 
-        if trip_day < date.today():
-            raise ValueError("Date must be today or later.")
+        if ride_day < date.today().isoformat():
+            raise ValueError(
+                "Choose today or a future date."
+            )
 
         seats = int(seats)
         gas = float(gas)
-        stay = int(stay)
         wait = int(wait)
 
         if not 1 <= seats <= 7:
-            raise ValueError("Seats must be between 1 and 7.")
+            raise ValueError(
+                "Choose between 1 and 7 seats."
+            )
 
-        if gas < 0:
-            raise ValueError("Gas contribution cannot be negative.")
-
-        if not 0 <= stay <= 600:
-            raise ValueError("Check destination duration.")
+        if not 0 <= gas <= 100:
+            raise ValueError(
+                "Gas share must be between $0 and $100."
+            )
 
         if not 0 <= wait <= 60:
-            raise ValueError("Waiting time must be 0–60 minutes.")
+            raise ValueError(
+                "Waiting time must be 0–60 minutes."
+            )
 
-        if trip_type == "Round trip":
-            ret = datetime.strptime(
-                str(return_time).strip(), "%H:%M"
-            ).time()
+        if ret != "No return trip" and ret <= depart:
+            raise ValueError(
+                "Return time must be after departure "
+                "on the same day."
+            )
 
-            if datetime.combine(trip_day, ret) <= datetime.combine(
-                trip_day, leave
-            ):
-                raise ValueError(
-                    "Return departure must be later than outbound departure."
-                )
+    except (ValueError, TypeError) as error:
+        return str(error), gr.update()
 
-            minutes = (
-                datetime.combine(trip_day, ret)
-                - datetime.combine(trip_day, leave)
-            ).total_seconds() / 60
+    ride_id = new_id()
 
-            if stay > minutes:
-                raise ValueError(
-                    "Destination duration exceeds the return window."
-                )
-
-    except (ValueError, TypeError) as e:
-        return (
-            f"Check the details: {e}. Times use 24-hour HH:MM.",
-            ride_rows()
-        )
-
-    rid = uid()
-
-    with lock, db() as con:
+    with LOCK, connect() as con:
         con.execute("""
-            INSERT INTO rides VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            INSERT INTO rides (
+                id, driver, email, destination,
+                pickup, ride_date, depart,
+                return_time, seats, available,
+                gas, wait, notes, status
+            )
+            VALUES (
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,'open'
             )
         """, (
-            rid,
-            driver.strip(),
-            email.strip(),
-            destination.strip(),
-            day.strip(),
-            depart.strip(),
-            pickup.strip(),
+            ride_id,
+            clean(driver),
+            clean(email),
+            clean(destination),
+            clean(pickup),
+            ride_day,
+            depart,
+            None if ret == "No return trip" else ret,
             seats,
             seats,
             gas,
-            trip_type,
-            str(return_time).strip() if trip_type == "Round trip" else None,
-            stay,
             wait,
-            str(notes).strip(),
-            "OPEN"
+            clean(notes)
         ))
 
-        event(con, "Ride posted", rid)
-
     return (
-        f"Ride {rid} posted! {seats} seat(s). "
-        "Driver identity is not verified.",
-        ride_rows()
+        f"🎉 Your ride is posted! "
+        f"Ride code: {ride_id}. "
+        "Find it under Find a ride.",
+        gr.update()
     )
 
 
-def reserve(rid, rider, email, seats, leg):
-    if (
-        not str(rid).strip()
-        or not str(rider).strip()
-        or not demo_email(email)
-    ):
+# ----------------------------------------
+# BOOK A RIDE
+# ----------------------------------------
+
+def book(ride_id, rider, email, seats, trip):
+    if not ride_id:
+        return "Select an available ride first."
+
+    if not clean(rider) or not valid_email(email):
         return (
-            "Enter Ride ID, name and a demo @tcu.edu email. "
-            "Email format is NOT identity verification.",
-            ride_rows()
+            "Enter a display name and demo @tcu.edu email. "
+            "Emails are not verified."
         )
 
     try:
         seats = int(seats)
-        if seats < 1:
-            raise ValueError
-    except (TypeError, ValueError):
-        return "Seats must be a positive whole number.", ride_rows()
 
-    with lock, db() as con:
-        r = con.execute(
-            'SELECT * FROM rides WHERE ride_id=? AND status="OPEN"',
-            (rid.strip().upper(),)
-        ).fetchone()
+        if seats < 1 or seats > 7:
+            raise ValueError()
 
-        if not r:
-            return "That ride is not available.", ride_rows()
+    except (ValueError, TypeError):
+        return "Select 1–7 seats."
 
-        if seats > r["seats_left"]:
+    with LOCK, connect() as con:
+        ride = con.execute("""
+            SELECT *
+            FROM rides
+            WHERE id=? AND status='open'
+        """, (ride_id,)).fetchone()
+
+        if not ride or ride["available"] < seats:
             return (
-                f"Only {r['seats_left']} seat(s) left.",
-                ride_rows()
+                "This ride no longer has enough seats. "
+                "Refresh the results."
             )
 
-        if leg != "Outbound only" and r["trip_type"] != "Round trip":
+        if (
+            trip == "Going and returning"
+            and not ride["return_time"]
+        ):
             return (
-                "This driver only offers a one-way trip.",
-                ride_rows()
+                "This ride is one-way. "
+                "Choose outbound only."
             )
 
-        bid = uid(9)
+        booking_id = new_id()
 
         con.execute("""
             UPDATE rides
-            SET seats_left=seats_left-?
-            WHERE ride_id=?
-        """, (seats, r["ride_id"]))
+            SET available=available-?
+            WHERE id=?
+        """, (seats, ride_id))
 
         con.execute("""
-            INSERT INTO bookings VALUES (?,?,?,?,?,?,?)
+            INSERT INTO bookings
+            VALUES (?,?,?,?,?,?,?,?)
         """, (
-            bid,
-            r["ride_id"],
-            rider.strip(),
-            email.strip(),
+            booking_id,
+            ride_id,
+            clean(rider),
+            clean(email),
             seats,
-            leg,
-            "BOOKED"
+            trip,
+            "booked",
+            datetime.now().isoformat(
+                timespec="seconds"
+            )
         ))
 
-        event(
-            con,
-            "Seat reserved",
-            f'{bid} on {r["ride_id"]}'
-        )
-
     return (
-        f"Booked! Save confirmation {bid}. {leg}. "
-        "No actual notification was sent.",
-        ride_rows()
+        f"🎉 Seat saved! Your booking code is "
+        f"{booking_id}. Keep this code to view "
+        "or cancel your demo booking. "
+        "No message was sent."
     )
 
 
-def cancel_seat(bid):
-    with lock, db() as con:
-        b = con.execute("""
-            SELECT * FROM bookings
-            WHERE booking_id=? AND status="BOOKED"
-        """, (str(bid).strip().upper(),)).fetchone()
+# ----------------------------------------
+# VIEW A BOOKING
+# ----------------------------------------
 
-        if not b:
-            return "Active booking not found.", ride_rows()
+def lookup_booking(code):
+    with connect() as con:
+        row = con.execute("""
+            SELECT
+                b.*,
+                r.destination,
+                r.ride_date,
+                r.depart,
+                r.return_time,
+                r.pickup
+            FROM bookings b
+            JOIN rides r ON b.ride_id=r.id
+            WHERE b.id=?
+        """, (
+            clean(code).upper(),
+        )).fetchone()
 
-        con.execute("""
-            UPDATE bookings
-            SET status="CANCELLED"
-            WHERE booking_id=?
-        """, (b["booking_id"],))
-
-        con.execute("""
-            UPDATE rides
-            SET seats_left=MIN(seats_total,seats_left+?)
-            WHERE ride_id=? AND status="OPEN"
-        """, (b["seats"], b["ride_id"]))
-
-        event(con, "Booking cancelled", b["booking_id"])
+    if not row:
+        return "No booking found. Check the code."
 
     return (
-        f'Booking {b["booking_id"]} cancelled; '
-        f'{b["seats"]} seat(s) reopened if the ride is active.',
-        ride_rows()
+        f"**{row['destination']}** · "
+        f"{row['ride_date']} at {row['depart']}\n\n"
+        f"Pickup: {row['pickup']}\n\n"
+        f"Reservation: {row['trip']} · "
+        f"{row['seats']} seat(s)\n\n"
+        f"Status: **{row['status'].title()}**\n\n"
+        f"Booking code: `{row['id']}`"
     )
 
 
-def cancel_trip(rid):
-    with lock, db() as con:
-        r = con.execute("""
-            SELECT * FROM rides
-            WHERE ride_id=? AND status="OPEN"
-        """, (str(rid).strip().upper(),)).fetchone()
+# ----------------------------------------
+# CANCEL A BOOKING
+# ----------------------------------------
 
-        if not r:
+def cancel_booking(code):
+    code = clean(code).upper()
+
+    with LOCK, connect() as con:
+        booking = con.execute("""
+            SELECT *
+            FROM bookings
+            WHERE id=? AND status='booked'
+        """, (code,)).fetchone()
+
+        if not booking:
             return (
-                "Open ride not found.",
-                ride_rows(),
-                pd.DataFrame(columns=["Booking", "Status"])
+                "No active booking found for that code."
             )
 
-        affected = con.execute("""
-            SELECT booking_id FROM bookings
-            WHERE ride_id=? AND status="BOOKED"
-        """, (r["ride_id"],)).fetchall()
+        con.execute("""
+            UPDATE bookings
+            SET status='cancelled'
+            WHERE id=?
+        """, (code,))
 
         con.execute("""
             UPDATE rides
-            SET status="CANCELLED"
-            WHERE ride_id=?
-        """, (r["ride_id"],))
-
-        con.execute("""
-            UPDATE bookings
-            SET status="DRIVER CANCELLED"
-            WHERE ride_id=? AND status="BOOKED"
-        """, (r["ride_id"],))
-
-        event(con, "Driver cancelled ride", r["ride_id"])
-
-    affected_table = pd.DataFrame(
-        [
-            {
-                "Booking": x["booking_id"],
-                "Status": "Would notify"
-            }
-            for x in affected
-        ],
-        columns=["Booking", "Status"]
-    )
+            SET available=MIN(seats,available+?)
+            WHERE id=? AND status='open'
+        """, (
+            booking["seats"],
+            booking["ride_id"]
+        ))
 
     return (
-        f"Ride cancelled. {len(affected)} booking(s) "
-        "flagged for notification; no real alerts were sent.",
-        ride_rows(),
-        affected_table
+        f"Booking {code} cancelled. "
+        "The seats are available again "
+        "if the ride is still open."
     )
 
 
-def alternatives(destination):
-    return (
-        ride_rows(str(destination).strip()),
-        "These are other currently listed rides, "
-        "not guaranteed replacement transport."
-    )
-
-
-def recent_events():
-    with db() as con:
-        rows = con.execute("""
-            SELECT created_at, event, details
-            FROM events
-            ORDER BY rowid DESC
-            LIMIT 15
-        """).fetchall()
-
-    return pd.DataFrame(
-        [dict(x) for x in rows],
-        columns=["created_at", "event", "details"]
-    )
-
-
-# --------------------------------------------------
-# TCU THEME — WHITE/PURPLE + BLACK/PURPLE
-# --------------------------------------------------
+# ----------------------------------------
+# STYLING
+# ----------------------------------------
 
 CSS = """
 :root {
-    --hop-purple: #4D1979;
-    --hop-purple2: #6B2DA1;
-    --hop-light: #F5F0FB;
+    color-scheme: light;
+}
+
+html,
+body,
+.gradio-container {
+    background: #faf8ff !important;
+    color: #261d33 !important;
 }
 
 .gradio-container {
-    max-width: 1180px !important;
-    font-family: Inter, ui-sans-serif, system-ui, sans-serif !important;
+    max-width: 1100px !important;
+    margin: auto !important;
+    padding: 12px 18px 40px !important;
+    font-family:
+        ui-sans-serif,
+        system-ui,
+        -apple-system,
+        sans-serif !important;
 }
 
-.gradio-container:not(.dark) {
-    background: #FFFFFF !important;
-    color: #21152E !important;
-}
-
-.gradio-container.dark {
-    background: #0C0911 !important;
-    color: #F5ECFF !important;
+.gradio-container * {
+    box-sizing: border-box;
 }
 
 #hero {
-    background: linear-gradient(115deg, #351052, #67299B) !important;
-    color: white !important;
-    border-radius: 20px !important;
-    padding: 24px 30px !important;
-    box-shadow: 0 10px 28px #2D0D4A26;
+    background: linear-gradient(
+        120deg,
+        #401164 0%,
+        #6b2ba0 75%,
+        #8a50bb 100%
+    );
+
+    border-radius: 24px;
+    padding: 32px 34px;
+    margin: 8px 0 20px;
+    box-shadow: 0 12px 28px #4d197925;
 }
 
-#hero h1,
-#hero h2,
-#hero p,
-#hero strong {
+#hero,
+#hero * {
     color: white !important;
 }
 
 #hero h1 {
-    font-size: 2.5rem !important;
-    margin: 0 !important;
+    font-size: clamp(2rem, 5vw, 3.1rem);
+    margin: 0 0 8px !important;
+    font-weight: 800;
 }
 
 #hero p {
-    opacity: .94;
+    font-size: clamp(.95rem, 2vw, 1.1rem);
+    margin: 4px 0 !important;
 }
 
-.gradio-container button.primary {
-    background: #4D1979 !important;
-    color: white !important;
-    border: 1px solid #6B2DA1 !important;
-    border-radius: 10px !important;
+#hero .sub {
+    opacity: .9;
 }
 
-.gradio-container button.primary:hover {
-    background: #6B2DA1 !important;
+.gradio-container .block,
+.gradio-container .form {
+    border-radius: 14px !important;
 }
 
-.gradio-container:not(.dark) .tab-nav {
-    border-bottom: 2px solid #E5D8F2 !important;
+.gradio-container .tab-nav {
+    border-bottom: 1px solid #e9ddf4 !important;
+    gap: 7px !important;
+    flex-wrap: wrap !important;
+}
+
+.gradio-container .tab-nav button {
+    border-radius: 12px 12px 0 0 !important;
+    color: #503668 !important;
+    font-weight: 650 !important;
 }
 
 .gradio-container .tab-nav button.selected {
-    color: #7B3BB5 !important;
-    border-bottom: 3px solid #7B3BB5 !important;
+    color: #4d1979 !important;
+    background: #efe6f8 !important;
+    border-bottom: 3px solid #4d1979 !important;
 }
 
-.gradio-container:not(.dark) .form,
-.gradio-container:not(.dark) .block {
+.gradio-container button.primary {
+    background: #4d1979 !important;
+    color: white !important;
+    border: 1px solid #4d1979 !important;
+    border-radius: 12px !important;
+    font-weight: 700 !important;
+}
+
+.gradio-container button.primary:hover {
+    background: #6c3299 !important;
+}
+
+.gradio-container input,
+.gradio-container textarea,
+.gradio-container select {
+    background: #ffffff !important;
+    color: #21182c !important;
+    border-radius: 9px !important;
+}
+
+.gradio-container label,
+.gradio-container .label-wrap,
+.gradio-container .prose,
+.gradio-container .prose p,
+.gradio-container .prose h2,
+.gradio-container .prose h3 {
+    color: #30223f !important;
+}
+
+.ride-grid {
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit, minmax(min(100%, 290px), 1fr));
+    gap: 15px;
+    margin: 12px 0 22px;
+}
+
+.ride-card {
+    background: #ffffff;
+    border: 1px solid #e7d9f2;
+    border-radius: 18px;
+    padding: 20px;
+    box-shadow: 0 5px 16px #4d19790c;
+    min-width: 0;
+}
+
+.ride-top,
+.ride-bottom {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.pill {
+    background: #efe6f8;
+    color: #4d1979;
+    font-size: .77rem;
+    padding: 6px 10px;
+    border-radius: 999px;
+    font-weight: 700;
+}
+
+.ride-price {
+    font-size: 1.15rem;
+    font-weight: 800;
+    color: #4d1979;
+}
+
+.ride-price small {
+    font-size: .65rem;
+    display: block;
+    color: #72637d;
+    font-weight: 500;
+}
+
+.ride-card h3 {
+    color: #2b153c;
+    font-size: 1.35rem;
+    margin: 16px 0 12px;
+    overflow-wrap: anywhere;
+}
+
+.ride-meta {
+    color: #574b63;
+    font-size: .88rem;
+    margin: 8px 0;
+    overflow-wrap: anywhere;
+}
+
+.ride-bottom {
+    border-top: 1px solid #eee7f3;
+    margin-top: 16px;
+    padding-top: 13px;
+    color: #47364f;
+    font-size: .8rem;
+}
+
+.ride-bottom strong {
+    color: #4d1979;
+}
+
+.ride-bottom small {
+    color: #887b90;
+}
+
+.ride-note {
+    color: #61516d;
+    font-size: .83rem;
+    margin: 12px 0 0;
+}
+
+.empty {
+    background: #ffffff;
+    border: 2px dashed #e3d2f1;
+    border-radius: 18px;
+    padding: 30px 20px;
+    text-align: center;
+    color: #6c5c77;
+}
+
+.empty-icon {
+    font-size: 2rem;
+}
+
+.empty h3 {
+    color: #3c2154;
+    margin: 8px 0;
+}
+
+.empty p {
+    margin: 5px 0;
+}
+
+#footnote {
+    padding: 14px 18px;
+    background: #f0eaf7;
     border-radius: 12px;
+    font-size: .84rem;
+    margin-top: 24px;
 }
 
-.gradio-container.dark .tab-nav button.selected {
-    color: #CFA5FF !important;
-    border-bottom-color: #A96DE1 !important;
+#footnote,
+#footnote * {
+    color: #5a4968 !important;
 }
 
-#safety {
-    border-left: 4px solid #8B5CC1 !important;
-    padding: 12px 18px !important;
-    border-radius: 8px !important;
+@media (max-width: 640px) {
+    .gradio-container {
+        padding: 8px 10px 25px !important;
+    }
+
+    #hero {
+        padding: 24px 19px;
+        border-radius: 18px;
+    }
+
+    .ride-card {
+        padding: 16px;
+    }
+
+    .gradio-container .tab-nav button {
+        font-size: .82rem !important;
+        padding: 8px !important;
+    }
 }
 """
 
 
-# --------------------------------------------------
-# GRADIO WEBSITE
-# --------------------------------------------------
+# ----------------------------------------
+# HOPIN WEBSITE
+# ----------------------------------------
 
 with gr.Blocks(
     title="HopIN | TCU Campus Rides",
@@ -538,400 +817,420 @@ with gr.Blocks(
     )
 ) as demo:
 
+    gr.HTML("""
+    <div id="hero">
+        <h1>🐸 HopIN</h1>
+        <p>
+            <strong>
+                The ride already exists.
+                The connection doesn't.
+            </strong>
+        </p>
+        <p class="sub">
+            Going somewhere? Share the journey. 💜
+        </p>
+    </div>
+    """)
+
+    with gr.Tabs():
+
+        # --------------------------------
+        # FIND A RIDE
+        # --------------------------------
+
+        with gr.Tab("🔎 Find a ride"):
+
+            gr.Markdown("## Where are we going?")
+
+            with gr.Row():
+                q_destination = gr.Textbox(
+                    label="Destination",
+                    placeholder="Try Target, Clearfork, or H-E-B",
+                    scale=2
+                )
+
+                q_date = gr.DateTime(
+                    label="Travel date (tap for calendar)",
+                    include_time=False,
+                    type="string",
+                    value=None,
+                    scale=1
+                )
+
+            with gr.Row():
+                q_period = gr.Dropdown(
+                    [
+                        "Any time",
+                        "Morning",
+                        "Afternoon",
+                        "Evening"
+                    ],
+                    value="Any time",
+                    label="Time of day"
+                )
+
+                q_budget = gr.Slider(
+                    0,
+                    25,
+                    value=25,
+                    step=1,
+                    label="Max suggested gas share ($)"
+                )
+
+            search_btn = gr.Button(
+                "✨ Find rides",
+                variant="primary"
+            )
+
+            count = gr.Markdown(
+                "See what trips students have shared below."
+            )
+
+            cards = gr.HTML(
+                value=card_html(list_rides())
+            )
+
+            gr.Markdown("### 💺 Save a seat")
+
+            gr.Markdown(
+                "Choose a ride below, then enter a "
+                "**fictional** name and email for this demo."
+            )
+
+            ride_select = gr.Dropdown(
+                choices=choices(list_rides()),
+                label="Choose a ride",
+                interactive=True
+            )
+
+            with gr.Row():
+                rider_name = gr.Textbox(
+                    label="Your display name",
+                    placeholder="Demo Student"
+                )
+
+                rider_email = gr.Textbox(
+                    label="Demo TCU email",
+                    placeholder="student@tcu.edu"
+                )
+
+            with gr.Row():
+                book_seats = gr.Dropdown(
+                    [1, 2, 3, 4, 5, 6, 7],
+                    value=1,
+                    label="Seats needed"
+                )
+
+                book_trip = gr.Radio(
+                    [
+                        "Outbound only",
+                        "Going and returning"
+                    ],
+                    value="Outbound only",
+                    label="Trip plan"
+                )
+
+            book_btn = gr.Button(
+                "💜 Reserve my seat",
+                variant="primary"
+            )
+
+            booking_message = gr.Textbox(
+                label="Booking confirmation",
+                interactive=False,
+                lines=3
+            )
+
+            search_btn.click(
+                search,
+                [
+                    q_destination,
+                    q_date,
+                    q_period,
+                    q_budget
+                ],
+                [
+                    cards,
+                    ride_select,
+                    count
+                ]
+            )
+
+            book_btn.click(
+                book,
+                [
+                    ride_select,
+                    rider_name,
+                    rider_email,
+                    book_seats,
+                    book_trip
+                ],
+                [booking_message]
+            ).then(
+                search,
+                [
+                    q_destination,
+                    q_date,
+                    q_period,
+                    q_budget
+                ],
+                [
+                    cards,
+                    ride_select,
+                    count
+                ]
+            )
+
+        # --------------------------------
+        # OFFER A RIDE
+        # --------------------------------
+
+        with gr.Tab("🚗 Offer a ride"):
+
+            gr.Markdown("## Have an extra seat? 💜")
+
+            gr.Markdown(
+                "Already heading out? Share the details "
+                "so another student can join your trip."
+            )
+
+            with gr.Row():
+                driver_name = gr.Textbox(
+                    label="Driver display name",
+                    placeholder="Demo Driver"
+                )
+
+                driver_email = gr.Textbox(
+                    label="Demo TCU email",
+                    placeholder="driver@tcu.edu"
+                )
+
+            with gr.Row():
+                dest = gr.Textbox(
+                    label="Where are you going?",
+                    placeholder="Target on West 7th"
+                )
+
+                pickup = gr.Textbox(
+                    label="Where should riders meet?",
+                    placeholder="Campus pickup point"
+                )
+
+            with gr.Row():
+                travel_date = gr.DateTime(
+                    label="Departure date (tap for calendar)",
+                    include_time=False,
+                    type="string",
+                    value=date.today().isoformat()
+                )
+
+                depart = gr.Dropdown(
+                    TIMES,
+                    value="14:00",
+                    label="Leaving at"
+                )
+
+                ret = gr.Dropdown(
+                    ["No return trip"] + TIMES,
+                    value="No return trip",
+                    label="Return trip leaves at"
+                )
+
+            with gr.Row():
+                offer_seats = gr.Slider(
+                    1,
+                    7,
+                    value=3,
+                    step=1,
+                    label="Seats available"
+                )
+
+                gas = gr.Slider(
+                    0,
+                    20,
+                    value=3,
+                    step=1,
+                    label="Suggested gas share ($ / seat)"
+                )
+
+                wait = gr.Slider(
+                    0,
+                    60,
+                    value=10,
+                    step=5,
+                    label="Minutes willing to wait at pickup"
+                )
+
+            notes = gr.Textbox(
+                label="Anything else riders should know?",
+                placeholder=(
+                    "e.g. I plan to shop for about an hour."
+                ),
+                lines=2
+            )
+
+            post_btn = gr.Button(
+                "🚀 Post my ride",
+                variant="primary"
+            )
+
+            post_message = gr.Textbox(
+                label="Your ride",
+                interactive=False,
+                lines=2
+            )
+
+            post_btn.click(
+                post,
+                [
+                    driver_name,
+                    driver_email,
+                    dest,
+                    pickup,
+                    travel_date,
+                    depart,
+                    ret,
+                    offer_seats,
+                    gas,
+                    wait,
+                    notes
+                ],
+                [
+                    post_message,
+                    ride_select
+                ]
+            ).then(
+                search,
+                [
+                    q_destination,
+                    q_date,
+                    q_period,
+                    q_budget
+                ],
+                [
+                    cards,
+                    ride_select,
+                    count
+                ]
+            )
+
+        # --------------------------------
+        # MY BOOKING
+        # --------------------------------
+
+        with gr.Tab("🎟️ My booking"):
+
+            gr.Markdown("## Keep track of your seat")
+
+            gr.Markdown(
+                "Use the booking code shown "
+                "when you reserved a seat."
+            )
+
+            lookup_code = gr.Textbox(
+                label="Booking code",
+                placeholder="e.g. A1B2C3D4"
+            )
+
+            with gr.Row():
+                lookup_btn = gr.Button(
+                    "View booking",
+                    variant="primary"
+                )
+
+                cancel_btn = gr.Button(
+                    "Cancel my booking",
+                    variant="secondary"
+                )
+
+            lookup_result = gr.Markdown(
+                "Your booking details will appear here."
+            )
+
+            lookup_btn.click(
+                lookup_booking,
+                [lookup_code],
+                [lookup_result]
+            )
+
+            cancel_btn.click(
+                cancel_booking,
+                [lookup_code],
+                [lookup_result]
+            ).then(
+                search,
+                [
+                    q_destination,
+                    q_date,
+                    q_period,
+                    q_budget
+                ],
+                [
+                    cards,
+                    ride_select,
+                    count
+                ]
+            )
+
+        # --------------------------------
+        # ABOUT HOPIN
+        # --------------------------------
+
+        with gr.Tab("💜 About HopIN"):
+
+            gr.Markdown("""
+## A little less hassle, a little more community
+
+HopIN is a student-built idea for connecting
+people who are already going somewhere with
+classmates who need a ride.
+
+The goal is to make shared trips easier to plan,
+with clear pickup points, departure times,
+return plans, and available seats.
+
+### What works in this demo
+
+- Search for available rides
+- Post a new ride
+- Select travel dates using a calendar
+- Choose departure and return times
+- View available seats
+- Reserve a seat
+- Get a booking confirmation code
+- View or cancel a booking
+
+### What still needs to be built
+
+- University-approved student authentication
+- Driver and vehicle verification
+- Driver-only ride management
+- Separate outbound and return seat tracking
+- Real cancellation notifications
+- Secure production data storage
+- Safety and insurance review
+
+**This is a classroom prototype, not an
+approved transportation service.**
+""")
+
     gr.Markdown("""
-# 🐸 HopIN
-### The ride already exists. The connection doesn't.
-
-**TCU-inspired campus carpool prototype**
-
-Share an existing trip, plan the timing, and reserve a seat.
-""", elem_id="hero")
-
-    gr.Markdown("""
-**⚠️ CLASSROOM DEMO ONLY:**
-
-No real TCU authentication, driver screening, payments,
-emergency assistance, or messages.
-
-Do not enter real personal data or arrange actual rides
-through this demo.
-""", elem_id="safety")
-
-    gr.Markdown("""
-**Appearance:** Use the Gradio theme switch to toggle
-between white + TCU purple and black + purple.
-""")
-
-    # FIND A RIDE
-    with gr.Tab("🔎 Find a Ride"):
-
-        gr.Markdown("### Find a trip that fits your plans")
-
-        with gr.Row():
-            query = gr.Textbox(
-                label="Destination",
-                placeholder="Target, Clearfork, Stockyards..."
-            )
-
-            day_filter = gr.Textbox(
-                label="Date (optional)",
-                placeholder="YYYY-MM-DD"
-            )
-
-            max_gas = gr.Number(
-                label="Max gas share ($)",
-                value=20,
-                minimum=0
-            )
-
-        find = gr.Button("Search rides", variant="primary")
-
-        result = gr.Textbox(
-            label="Search status",
-            interactive=False
-        )
-
-        table = gr.Dataframe(
-            value=ride_rows(),
-            interactive=False,
-            label="Available rides"
-        )
-
-        find.click(
-            search,
-            [query, day_filter, max_gas],
-            [table, result]
-        )
-
-        gr.Markdown("### Reserve your seat")
-
-        gr.Markdown("""
-For round trips, select **Outbound + return** if you
-plan to ride both legs.
-
-The return schedule is set by the driver.
-
-This demo tracks one seat allocation per booking,
-not independent leg capacity.
-""")
-
-        with gr.Row():
-            ride_id = gr.Textbox(label="Ride ID")
-
-            rider = gr.Textbox(
-                label="Rider display name",
-                placeholder="Demo Rider"
-            )
-
-            rider_email = gr.Textbox(
-                label="TCU-format email (not verified)",
-                placeholder="demo@tcu.edu"
-            )
-
-        with gr.Row():
-            qty = gr.Number(
-                label="Seats",
-                value=1,
-                precision=0,
-                minimum=1
-            )
-
-            leg = gr.Radio(
-                ["Outbound only", "Outbound + return"],
-                value="Outbound only",
-                label="Reservation"
-            )
-
-        book = gr.Button("Reserve seat", variant="primary")
-
-        book_status = gr.Textbox(
-            label="Booking confirmation",
-            interactive=False
-        )
-
-        book.click(
-            reserve,
-            [ride_id, rider, rider_email, qty, leg],
-            [book_status, table]
-        )
-
-    # OFFER A RIDE
-    with gr.Tab("🚗 Offer a Ride"):
-
-        gr.Markdown("### Share a trip you already plan to make")
-
-        with gr.Row():
-            driver = gr.Textbox(
-                label="Driver display name",
-                placeholder="Demo Driver"
-            )
-
-            driver_email = gr.Textbox(
-                label="TCU-format email (not verified)",
-                placeholder="driver@tcu.edu"
-            )
-
-        with gr.Row():
-            destination = gr.Textbox(
-                label="Destination",
-                placeholder="Target"
-            )
-
-            pickup = gr.Textbox(
-                label="Pickup point",
-                placeholder="Example: campus meeting point"
-            )
-
-        with gr.Row():
-            trip_date = gr.Textbox(
-                label="Date (YYYY-MM-DD)",
-                value=date.today().isoformat()
-            )
-
-            depart = gr.Textbox(
-                label="Departure time (24-hour)",
-                value="14:00"
-            )
-
-            trip_type = gr.Radio(
-                ["One-way", "Round trip"],
-                value="Round trip",
-                label="Trip type"
-            )
-
-            ret = gr.Textbox(
-                label="Return departure (24-hour, if round trip)",
-                value="16:00"
-            )
-
-        with gr.Row():
-            stay = gr.Slider(
-                0, 240,
-                value=60,
-                step=5,
-                label="Expected time at destination (minutes)"
-            )
-
-            wait = gr.Slider(
-                0, 60,
-                value=10,
-                step=5,
-                label="Maximum pickup wait / grace period (minutes)"
-            )
-
-        with gr.Row():
-            seats = gr.Number(
-                label="Available seats",
-                value=3,
-                precision=0,
-                minimum=1,
-                maximum=7
-            )
-
-            gas = gr.Number(
-                label="Suggested gas contribution per rider ($)",
-                value=3,
-                minimum=0
-            )
-
-        notes = gr.Textbox(
-            label="Trip expectations / notes",
-            placeholder="Meeting point, stops, return expectations...",
-            lines=2
-        )
-
-        publish = gr.Button("Post ride", variant="primary")
-
-        publish_status = gr.Textbox(
-            label="Posting status",
-            interactive=False
-        )
-
-        publish.click(
-            post,
-            [
-                driver,
-                driver_email,
-                destination,
-                trip_date,
-                depart,
-                pickup,
-                seats,
-                gas,
-                trip_type,
-                ret,
-                stay,
-                wait,
-                notes
-            ],
-            [publish_status, table]
-        )
-
-    # MANAGE AND CANCEL
-    with gr.Tab("↩️ Manage & Cancel"):
-
-        gr.Markdown("### Cancel a rider reservation")
-
-        booking_code = gr.Textbox(
-            label="Booking confirmation code"
-        )
-
-        cancel_book = gr.Button(
-            "Cancel my seat",
-            variant="primary"
-        )
-
-        booking_cancel_status = gr.Textbox(
-            label="Status",
-            interactive=False
-        )
-
-        cancel_book.click(
-            cancel_seat,
-            [booking_code],
-            [booking_cancel_status, table]
-        )
-
-        gr.Markdown(
-            "### Cancel an entire ride "
-            "(demo only — no authorization checks)"
-        )
-
-        cancel_id = gr.Textbox(label="Ride ID")
-
-        cancel_driver = gr.Button("Cancel ride")
-
-        ride_cancel_status = gr.Textbox(
-            label="Status",
-            interactive=False
-        )
-
-        affected = gr.Dataframe(
-            interactive=False,
-            label="Bookings that would need an alert"
-        )
-
-        cancel_driver.click(
-            cancel_trip,
-            [cancel_id],
-            [ride_cancel_status, table, affected]
-        )
-
-        gr.Markdown("### Find alternatives")
-
-        alt_dest = gr.Textbox(
-            label="Destination for alternative rides"
-        )
-
-        alt_btn = gr.Button("Show other rides")
-
-        alt_table = gr.Dataframe(
-            interactive=False,
-            label="Other available rides"
-        )
-
-        alt_note = gr.Textbox(
-            label="Note",
-            interactive=False
-        )
-
-        alt_btn.click(
-            alternatives,
-            [alt_dest],
-            [alt_table, alt_note]
-        )
-
-    # TRUST AND ROADMAP
-    with gr.Tab("🛡️ Trust & Roadmap"):
-
-        gr.Markdown("""
-### What the prototype does today
-
-- Posts and searches rides by destination and date.
-- Filters rides by suggested gas contribution.
-- Shows driver-set trip type and return departure.
-- Shows expected time at destination.
-- Shows maximum pickup waiting time.
-- Reserves seats and prevents overbooking.
-- Reopens seats after rider cancellations.
-- Marks cancelled rides and identifies affected bookings.
-- Stores demo ride and booking information in SQLite.
-
-### What must be built before real use
-
-**1. TCU student authentication**
-
-University-approved sign-in and verified student profiles.
-
-The current email-format check is not verification.
-
-**2. Driver eligibility and vehicle verification**
-
-Driver's license, insurance, vehicle information,
-driving-record checks, and required approvals.
-
-**3. Independent outbound and return reservations**
-
-Separate capacity and booking records for each trip leg.
-
-**4. Real-time notifications**
-
-Email, push, or SMS integration for reservations,
-cancellations, and schedule changes.
-
-**5. Better ride matching**
-
-Matching by destination, departure time, pickup location,
-return windows, and availability.
-
-**6. Secure data storage and administration**
-
-Managed database, access controls, audit logs,
-reporting, and privacy protections.
-
-**7. Driver waiting and duration rules**
-
-Clearly defined pickup grace periods, no-show procedures,
-and policies for unexpected delays.
-
-### Safety notice
-
-This demonstration does not verify identity,
-ensure passenger safety, or provide transportation.
-
-Do not use it to arrange real rides.
-""")
-
-    # ACTIVITY
-    with gr.Tab("📋 Demo Activity"):
-
-        gr.Markdown("""
-Recent demonstration activity.
-
-No actual email or text messages are sent.
-""")
-
-        refresh = gr.Button("Refresh activity")
-
-        activity = gr.Dataframe(
-            value=recent_events(),
-            interactive=False,
-            label="Recent actions"
-        )
-
-        refresh.click(
-            recent_events,
-            outputs=activity
-        )
-
-
-# --------------------------------------------------
-# RENDER DEPLOYMENT
-# --------------------------------------------------
+**Demo only:** Use made-up names and email addresses.
+TCU identities and drivers are not verified.
+No actual notifications are sent, and rides
+should not be arranged through this prototype.
+""", elem_id="footnote")
+
+
+# ----------------------------------------
+# RENDER STARTUP
+# ----------------------------------------
 
 if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", "7860")),
+        server_port=int(
+            os.environ.get("PORT", "7860")
+        ),
         share=False
     )
