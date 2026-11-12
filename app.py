@@ -1,6 +1,17 @@
 
-"""HopIN — responsive TCU-themed classroom ride-sharing demo.
-No identity verification, payments, notifications, or driver authorization.
+"""HopIN — TCU-themed student carpool classroom prototype.
+
+Features:
+- Responsive purple-and-white interface
+- Readable navigation tabs
+- Calendar date pickers
+- Exact departure time windows
+- AM/PM time selectors
+- Ride posting and searching
+- Seat reservations and cancellations
+
+Demo only: no real identity verification, driver screening,
+payments, notifications, or authorization.
 """
 
 import os
@@ -13,18 +24,40 @@ from threading import RLock
 
 import gradio as gr
 
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
 DB = os.environ.get("HOPIN_DB_PATH", "hopin_v2_demo.sqlite3")
 LOCK = RLock()
+
+# Every 15 minutes, displayed in AM/PM format.
+# Underlying values remain HH:MM for easy comparison.
 TIMES = [
-    f"{h:02d}:{m:02d}"
-    for h in range(6, 24)
-    for m in (0, 15, 30, 45)
+    (
+        datetime.strptime(
+            f"{hour:02d}:{minute:02d}", "%H:%M"
+        ).strftime("%I:%M %p").lstrip("0"),
+        f"{hour:02d}:{minute:02d}"
+    )
+    for hour in range(24)
+    for minute in (0, 15, 30, 45)
 ]
 
 
-# ----------------------------------------
+def time_label(value):
+    if not value:
+        return "No return trip"
+
+    return datetime.strptime(
+        value, "%H:%M"
+    ).strftime("%I:%M %p").lstrip("0")
+
+
+# =========================================================
 # DATABASE
-# ----------------------------------------
+# =========================================================
 
 def connect():
     con = sqlite3.connect(DB, timeout=20)
@@ -64,9 +97,9 @@ with connect() as con:
     """)
 
 
-# ----------------------------------------
+# =========================================================
 # HELPERS
-# ----------------------------------------
+# =========================================================
 
 def clean(value):
     return str(value or "").strip()
@@ -105,20 +138,27 @@ def money(value):
     return f"${value:,.2f}"
 
 
-# ----------------------------------------
-# FIND RIDES
-# ----------------------------------------
+# =========================================================
+# SEARCH RIDES
+# =========================================================
 
 def list_rides(
     destination="",
     selected_day="",
-    when="Any time",
+    earliest="00:00",
+    latest="23:45",
     max_gas=25
 ):
     try:
         day = day_string(selected_day)
     except ValueError:
         day = ""
+
+    earliest = earliest or "00:00"
+    latest = latest or "23:45"
+
+    if earliest > latest:
+        return []
 
     with connect() as con:
         rows = con.execute("""
@@ -134,24 +174,20 @@ def list_rides(
         if ride["ride_date"] < date.today().isoformat():
             continue
 
-        if clean(destination).lower() not in ride["destination"].lower():
+        if (
+            clean(destination).lower()
+            not in ride["destination"].lower()
+        ):
             continue
 
         if day and ride["ride_date"] != day:
             continue
 
-        if max_gas is not None and ride["gas"] > float(max_gas):
-            continue
+        if max_gas is not None:
+            if ride["gas"] > float(max_gas):
+                continue
 
-        hour = int(ride["depart"][:2])
-
-        if when == "Morning" and hour >= 12:
-            continue
-
-        if when == "Afternoon" and not (12 <= hour < 17):
-            continue
-
-        if when == "Evening" and hour < 17:
+        if not earliest <= ride["depart"] <= latest:
             continue
 
         output.append(ride)
@@ -159,9 +195,9 @@ def list_rides(
     return output
 
 
-# ----------------------------------------
-# BEAUTIFUL RIDE CARDS
-# ----------------------------------------
+# =========================================================
+# RIDE CARDS
+# =========================================================
 
 def card_html(rows):
     if not rows:
@@ -169,8 +205,10 @@ def card_html(rows):
         <div class="empty">
             <div class="empty-icon">🚙</div>
             <h3>No rides found yet</h3>
-            <p>Try another destination or date,
-            or be the first to offer a ride!</p>
+            <p>
+                Try another destination or time,
+                or be the first to offer a ride!
+            </p>
         </div>
         """
 
@@ -182,9 +220,12 @@ def card_html(rows):
         pickup = html.escape(ride["pickup"])
         notes = html.escape(ride["notes"])
 
+        departure_label = time_label(ride["depart"])
+
         if ride["return_time"]:
             return_label = (
-                f"↩ Return at {html.escape(ride['return_time'])}"
+                "↩ Return at "
+                + time_label(ride["return_time"])
             )
         else:
             return_label = "→ One-way ride"
@@ -213,7 +254,7 @@ def card_html(rows):
             <div class="ride-meta">
                 📅 {ride['ride_date']}
                 &nbsp; · &nbsp;
-                🕒 {ride['depart']}
+                🕒 {departure_label}
             </div>
 
             <div class="ride-meta">
@@ -225,7 +266,7 @@ def card_html(rows):
             </div>
 
             <div class="ride-meta">
-                ⏳ Waits up to {ride['wait']} minutes
+                ⏳ Pickup wait: up to {ride['wait']} min
             </div>
 
             <div class="ride-bottom">
@@ -255,7 +296,8 @@ def choices(rows):
     return [
         (
             f"{ride['destination']} · "
-            f"{ride['ride_date']} at {ride['depart']} · "
+            f"{ride['ride_date']} at "
+            f"{time_label(ride['depart'])} · "
             f"{ride['id']}",
             ride["id"]
         )
@@ -263,11 +305,26 @@ def choices(rows):
     ]
 
 
-def search(destination, day, period, budget):
+def search(
+    destination,
+    day,
+    earliest,
+    latest,
+    budget
+):
+    if earliest and latest and earliest > latest:
+        return (
+            card_html([]),
+            gr.update(choices=[], value=None),
+            "Choose a latest departure that is "
+            "after your earliest departure."
+        )
+
     rows = list_rides(
         destination,
         day,
-        period,
+        earliest,
+        latest,
         budget
     )
 
@@ -277,13 +334,13 @@ def search(destination, day, period, budget):
             choices=choices(rows),
             value=None
         ),
-        f"{len(rows)} ride(s) available"
+        f"Found {len(rows)} matching ride(s)."
     )
 
 
-# ----------------------------------------
+# =========================================================
 # POST A RIDE
-# ----------------------------------------
+# =========================================================
 
 def post(
     driver,
@@ -349,7 +406,7 @@ def post(
 
         if ret != "No return trip" and ret <= depart:
             raise ValueError(
-                "Return time must be after departure "
+                "Return time must be later than departure "
                 "on the same day."
             )
 
@@ -393,11 +450,17 @@ def post(
     )
 
 
-# ----------------------------------------
+# =========================================================
 # BOOK A RIDE
-# ----------------------------------------
+# =========================================================
 
-def book(ride_id, rider, email, seats, trip):
+def book(
+    ride_id,
+    rider,
+    email,
+    seats,
+    trip
+):
     if not ride_id:
         return "Select an available ride first."
 
@@ -470,9 +533,9 @@ def book(ride_id, rider, email, seats, trip):
     )
 
 
-# ----------------------------------------
-# VIEW A BOOKING
-# ----------------------------------------
+# =========================================================
+# VIEW BOOKING
+# =========================================================
 
 def lookup_booking(code):
     with connect() as con:
@@ -496,7 +559,8 @@ def lookup_booking(code):
 
     return (
         f"**{row['destination']}** · "
-        f"{row['ride_date']} at {row['depart']}\n\n"
+        f"{row['ride_date']} at "
+        f"{time_label(row['depart'])}\n\n"
         f"Pickup: {row['pickup']}\n\n"
         f"Reservation: {row['trip']} · "
         f"{row['seats']} seat(s)\n\n"
@@ -505,9 +569,9 @@ def lookup_booking(code):
     )
 
 
-# ----------------------------------------
-# CANCEL A BOOKING
-# ----------------------------------------
+# =========================================================
+# CANCEL BOOKING
+# =========================================================
 
 def cancel_booking(code):
     code = clean(code).upper()
@@ -546,9 +610,9 @@ def cancel_booking(code):
     )
 
 
-# ----------------------------------------
+# =========================================================
 # STYLING
-# ----------------------------------------
+# =========================================================
 
 CSS = """
 :root {
@@ -584,7 +648,6 @@ body,
         #6b2ba0 75%,
         #8a50bb 100%
     );
-
     border-radius: 24px;
     padding: 32px 34px;
     margin: 8px 0 20px;
@@ -611,27 +674,51 @@ body,
     opacity: .9;
 }
 
-.gradio-container .block,
-.gradio-container .form {
-    border-radius: 14px !important;
-}
-
+/* Readable navigation tabs */
 .gradio-container .tab-nav {
-    border-bottom: 1px solid #e9ddf4 !important;
-    gap: 7px !important;
+    display: flex !important;
     flex-wrap: wrap !important;
+    gap: 8px !important;
+    padding-bottom: 8px !important;
+    border-bottom: 1px solid #e5d8f0 !important;
 }
 
 .gradio-container .tab-nav button {
-    border-radius: 12px 12px 0 0 !important;
-    color: #503668 !important;
-    font-weight: 650 !important;
+    background: #f0e6fa !important;
+    color: #4d1979 !important;
+    border: 1px solid #e1d0ee !important;
+    border-radius: 12px !important;
+    padding: 11px 17px !important;
+    font-weight: 700 !important;
+    opacity: 1 !important;
+    text-shadow: none !important;
+}
+
+.gradio-container .tab-nav button,
+.gradio-container .tab-nav button * {
+    color: #4d1979 !important;
+    opacity: 1 !important;
+}
+
+.gradio-container .tab-nav button:hover {
+    background: #dfc9f2 !important;
+    color: #351052 !important;
 }
 
 .gradio-container .tab-nav button.selected {
-    color: #4d1979 !important;
-    background: #efe6f8 !important;
-    border-bottom: 3px solid #4d1979 !important;
+    background: #4d1979 !important;
+    color: #ffffff !important;
+    border-color: #4d1979 !important;
+}
+
+.gradio-container .tab-nav button.selected,
+.gradio-container .tab-nav button.selected * {
+    color: #ffffff !important;
+}
+
+.gradio-container .block,
+.gradio-container .form {
+    border-radius: 14px !important;
 }
 
 .gradio-container button.primary {
@@ -663,6 +750,7 @@ body,
     color: #30223f !important;
 }
 
+/* Ride cards */
 .ride-grid {
     display: grid;
     grid-template-columns:
@@ -782,6 +870,7 @@ body,
     color: #5a4968 !important;
 }
 
+/* Mobile-friendly layout */
 @media (max-width: 640px) {
     .gradio-container {
         padding: 8px 10px 25px !important;
@@ -796,17 +885,25 @@ body,
         padding: 16px;
     }
 
+    .gradio-container .tab-nav {
+        display: grid !important;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 7px !important;
+    }
+
     .gradio-container .tab-nav button {
-        font-size: .82rem !important;
-        padding: 8px !important;
+        width: 100% !important;
+        padding: 11px 6px !important;
+        font-size: 0.82rem !important;
+        text-align: center !important;
     }
 }
 """
 
 
-# ----------------------------------------
-# HOPIN WEBSITE
-# ----------------------------------------
+# =========================================================
+# WEBSITE
+# =========================================================
 
 with gr.Blocks(
     title="HopIN | TCU Campus Rides",
@@ -834,9 +931,9 @@ with gr.Blocks(
 
     with gr.Tabs():
 
-        # --------------------------------
+        # ---------------------------------------------
         # FIND A RIDE
-        # --------------------------------
+        # ---------------------------------------------
 
         with gr.Tab("🔎 Find a ride"):
 
@@ -858,24 +955,29 @@ with gr.Blocks(
                 )
 
             with gr.Row():
-                q_period = gr.Dropdown(
-                    [
-                        "Any time",
-                        "Morning",
-                        "Afternoon",
-                        "Evening"
-                    ],
-                    value="Any time",
-                    label="Time of day"
+                q_earliest = gr.Dropdown(
+                    choices=TIMES,
+                    value="00:00",
+                    label="Earliest departure",
+                    interactive=True,
+                    filterable=True
                 )
 
-                q_budget = gr.Slider(
-                    0,
-                    25,
-                    value=25,
-                    step=1,
-                    label="Max suggested gas share ($)"
+                q_latest = gr.Dropdown(
+                    choices=TIMES,
+                    value="23:45",
+                    label="Latest departure",
+                    interactive=True,
+                    filterable=True
                 )
+
+            q_budget = gr.Slider(
+                0,
+                25,
+                value=25,
+                step=1,
+                label="Max suggested gas share ($)"
+            )
 
             search_btn = gr.Button(
                 "✨ Find rides",
@@ -946,7 +1048,8 @@ with gr.Blocks(
                 [
                     q_destination,
                     q_date,
-                    q_period,
+                    q_earliest,
+                    q_latest,
                     q_budget
                 ],
                 [
@@ -971,7 +1074,8 @@ with gr.Blocks(
                 [
                     q_destination,
                     q_date,
-                    q_period,
+                    q_earliest,
+                    q_latest,
                     q_budget
                 ],
                 [
@@ -981,9 +1085,9 @@ with gr.Blocks(
                 ]
             )
 
-        # --------------------------------
+        # ---------------------------------------------
         # OFFER A RIDE
-        # --------------------------------
+        # ---------------------------------------------
 
         with gr.Tab("🚗 Offer a ride"):
 
@@ -1025,15 +1129,21 @@ with gr.Blocks(
                 )
 
                 depart = gr.Dropdown(
-                    TIMES,
+                    choices=TIMES,
                     value="14:00",
-                    label="Leaving at"
+                    label="What time are you leaving?",
+                    interactive=True,
+                    filterable=True
                 )
 
                 ret = gr.Dropdown(
-                    ["No return trip"] + TIMES,
+                    choices=[
+                        ("No return trip", "No return trip")
+                    ] + TIMES,
                     value="No return trip",
-                    label="Return trip leaves at"
+                    label="What time will you head back?",
+                    interactive=True,
+                    filterable=True
                 )
 
             with gr.Row():
@@ -1104,7 +1214,8 @@ with gr.Blocks(
                 [
                     q_destination,
                     q_date,
-                    q_period,
+                    q_earliest,
+                    q_latest,
                     q_budget
                 ],
                 [
@@ -1114,9 +1225,9 @@ with gr.Blocks(
                 ]
             )
 
-        # --------------------------------
+        # ---------------------------------------------
         # MY BOOKING
-        # --------------------------------
+        # ---------------------------------------------
 
         with gr.Tab("🎟️ My booking"):
 
@@ -1162,7 +1273,8 @@ with gr.Blocks(
                 [
                     q_destination,
                     q_date,
-                    q_period,
+                    q_earliest,
+                    q_latest,
                     q_budget
                 ],
                 [
@@ -1172,9 +1284,9 @@ with gr.Blocks(
                 ]
             )
 
-        # --------------------------------
+        # ---------------------------------------------
         # ABOUT HOPIN
-        # --------------------------------
+        # ---------------------------------------------
 
         with gr.Tab("💜 About HopIN"):
 
@@ -1194,7 +1306,8 @@ return plans, and available seats.
 - Search for available rides
 - Post a new ride
 - Select travel dates using a calendar
-- Choose departure and return times
+- Choose exact departure time ranges
+- Choose exact departure and return times
 - View available seats
 - Reserve a seat
 - Get a booking confirmation code
@@ -1222,9 +1335,9 @@ should not be arranged through this prototype.
 """, elem_id="footnote")
 
 
-# ----------------------------------------
+# =========================================================
 # RENDER STARTUP
-# ----------------------------------------
+# =========================================================
 
 if __name__ == "__main__":
     demo.launch(
